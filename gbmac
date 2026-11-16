@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Guarded macOS runner for the guides desk tester. Used only when MAC_TEST_HOST is set in config.env.
+# Runs commands over SSH as MAC_TEST_USER (a Standard, non-admin account) inside a fresh temporary
+# directory in that user's home, with HOME pointed into it so installers stay inside. No sudo.
+#
+#   newsroom/gbmac new                    create a temp dir, print its path (~/gb-guide-XXXXXX)
+#   newsroom/gbmac run <dir> '<command>'  run one shell command (bash) inside <dir>
+#   newsroom/gbmac blocks                 list the guide's shell code blocks (numbers, targets, headings)
+#   newsroom/gbmac block <dir> <n> [--detach]   run code block <n> of the guide exactly as published (bash, stops at the
+#                                         first failing command), inside <dir>: what the evidence check counts as a run.
+#                                         --detach starts it in the background (for steps over ten minutes) and prints its job id
+#   newsroom/gbmac block-status <dir> <job>   a detached block's output so far, and its exit status once it has finished
+#   newsroom/gbmac clean <dir>            delete <dir>
+#   newsroom/gbmac sweep                  stop the test account's leftover processes, then delete every ~/gb-guide-* dir
+#   newsroom/gbmac procs                  list the test account's own processes (not macOS services or apps)
+#   newsroom/gbmac reap                   stop those processes (servers or batches a killed run left behind)
+#   newsroom/gbmac info                   hardware, macOS version, free disk and model cache size
+#   newsroom/gbmac labenv                 lab conditions: power mode, thermal state, load, memory pressure, and the
+#                                         busiest processes of every user (record before and after measurements)
+#   newsroom/gbmac fetch <dir> <subdir>   copy <dir>/<subdir> (text files, max 50 MB) to $GUIDE_RUN_DIR/raw/<subdir>
+# Evidence: when the pipeline sets GB_EVIDENCE, every call goes through gbrecord.py, which records it outside the tester's reach.
+# Recording is skipped only for the recorder's own call, which carries the per-run nonce from the evidence directory
+# (the tester cannot read it), so setting GB_RECORDING by hand does not get past the record.
+_gbn="$(cat "${GB_EVIDENCE:-/nonexistent}/.nonce" 2>/dev/null)"
+if [ -n "${GB_EVIDENCE:-}" ] && { [ -z "$_gbn" ] || [ "${GB_RECORDING:-}" != "$_gbn" ]; }; then
+  exec python3 -I "$(dirname "$(readlink -f "$0")")/gbrecord.py" "$(readlink -f "$0")" "$@"
+fi
+set -uo pipefail
+: "${MAC_TEST_HOST:=}" "${MAC_TEST_USER:=}"
+[ -n "$MAC_TEST_HOST" ] || { echo "gbmac: MAC_TEST_HOST is not set; mac steps are checked against documentation only" >&2; exit 126; }
+[ -n "$MAC_TEST_USER" ] || { echo "gbmac: MAC_TEST_USER (the Mac test account) is not set" >&2; exit 126; }
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 "$MAC_TEST_USER@$MAC_TEST_HOST")
+die() { echo "gbmac: refused: $*" >&2; exit 126; }
+checkdir() { [[ "$1" =~ ^/Users/[A-Za-z0-9._-]+/gb-guide-[A-Za-z0-9]+$ ]] || die "dir must be a ~/gb-guide-* path from 'gbmac new' (got $1)"; }
+
+case "${1:-}" in
+  new)
+    # Model downloads persist across runs in ~/gb-cache (linked into the run's HOME at the usual paths),
+    # so a guide that pulls a 20 GB model does not fetch it again next time. Guide paths stay unchanged.
+    "${SSH[@]}" '/bin/bash -c '"'"'set -e; d=$(mktemp -d "$HOME/gb-guide-XXXXXX"); c="$HOME/gb-cache"
+      mkdir -p "$c/huggingface" "$c/ollama-models" "$c/lmstudio-models" "$c/llama.cpp" \
+        "$d/home/.cache" "$d/home/.ollama" "$d/home/.lmstudio" "$d/home/Library/Caches"
+      ln -s "$c/huggingface" "$d/home/.cache/huggingface"; ln -s "$c/ollama-models" "$d/home/.ollama/models"
+      ln -s "$c/lmstudio-models" "$d/home/.lmstudio/models"; ln -s "$c/llama.cpp" "$d/home/Library/Caches/llama.cpp"
+      echo "$d"'"'"'' ;;
+  run)
+    [ $# -eq 3 ] || die "usage: gbmac run <dir> '<command>'"
+    checkdir "$2"
+    grep -Eq '(^|[^A-Za-z0-9_-])(sudo|su|doas|dscl|sysadminctl|launchctl[[:space:]]+(bootstrap|load)[[:space:]]+system)([^A-Za-z0-9_-]|$)' <<<"$3" \
+      && die "no sudo or system-level changes on the Mac test account"
+    # Refuse host secrets in the command.
+    for v in $(env | grep -E '^[A-Z_]*(KEY|TOKEN|SECRET|PASSW|AUTH)[A-Z_]*=' | cut -d= -f2-); do
+      [ ${#v} -ge 12 ] && [[ "$3" == *"$v"* ]] && die "command contains a host secret"
+    done
+    inner="cd $(printf %q "$2") && export HOME=$(printf %q "$2/home") && mkdir -p \"\$HOME\" && export PATH=\"\$HOME/.local/bin:\$PATH\" && $3"
+    "${SSH[@]}" "/bin/bash -c $(printf %q "$inner")" ;;
+  blocks)
+    python3 -I "$(dirname "$(readlink -f "$0")")/guidedesk.py" blocks "${GUIDE_ARTICLE:?}" "${GUIDE_PLAN:?}" ;;
+  block-status)
+    [ $# -eq 3 ] || die "usage: gbmac block-status <dir> <job>"
+    checkdir "$2"
+    [[ "$3" =~ ^[0-9a-f]{16}$ ]] || die "not a block job id: $3"
+    "${SSH[@]}" "/bin/bash -c $(printf %q "cd $(printf %q "$2/home") && tail -c 4000 .gbblocks/$3.log 2>/dev/null; if [ -f .gbblocks/$3.rc ]; then rc=\$(cat .gbblocks/$3.rc); echo GBBLOCKEXIT=\$rc; exit \$rc; else echo GBBLOCKRUNNING; exit 75; fi")" ;;
+  block)
+    detach=0; [ "${4:-}" = --detach ] && detach=1 && set -- "$1" "$2" "$3"
+    [ $# -eq 3 ] || die "usage: gbmac block <dir> <n> [--detach]"
+    checkdir "$2"
+    script="$(python3 -I "$(dirname "$(readlink -f "$0")")/guidedesk.py" block "${GUIDE_ARTICLE:?}" "${GUIDE_PLAN:?}" "$3" zsh)" || die "no code block $3"
+    for v in $(env | grep -E '^[A-Z_]*(KEY|TOKEN|SECRET|PASSW|AUTH)[A-Z_]*=' | cut -d= -f2-); do
+      [ ${#v} -ge 12 ] && [[ "$script" == *"$v"* ]] && die "block contains a host secret"
+    done
+    # A block starts where a reader's terminal does: in the home folder.
+    inner="export HOME=$(printf %q "$2/home") && mkdir -p \"\$HOME\" && cd \"\$HOME\" && export PATH=\"\$HOME/.local/bin:\$PATH\""
+    # The block goes into a file and runs with stdin closed (a command that reads stdin cannot swallow the rest of the
+    # block), in a zsh login shell as in Terminal.
+    job="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    inner="$inner && mkdir -p .gbblocks && cat > .gbblocks/$job.sh"
+    if [ $detach = 1 ]; then
+      inner="$inner && (nohup /bin/bash -c '/bin/zsh -l .gbblocks/$job.sh > .gbblocks/$job.log 2>&1 < /dev/null; echo \$? > .gbblocks/$job.rc' </dev/null >/dev/null 2>&1 &) && echo GBBLOCKJOB=$job"
+    else
+      inner="$inner && exec /bin/zsh -l .gbblocks/$job.sh < /dev/null"
+    fi
+    printf '%s\n' "$script" | "${SSH[@]}" "/bin/bash -c $(printf %q "$inner")" ;;
+  clean)
+    checkdir "$2"
+    "${SSH[@]}" "rm -rf $(printf %q "$2")" ;;
+  info)
+    # Also the account's own tools outside the session directory (they are on PATH for every test, so a step that
+    # "worked" may have used one): ~/gb-tools/bin and what the login PATH finds.
+    "${SSH[@]}" '/bin/bash -c '"'"'sw_vers; sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu; df -h ~ | tail -1; du -sh ~/gb-cache 2>/dev/null
+      echo "tools in ~/gb-tools/bin: $(ls ~/gb-tools/bin 2>/dev/null | tr "\n" " ")"
+      for t in python3 git curl uv pixi brew node npm cmake ollama llama-server mlx_lm.generate tart; do p=$(command -v $t 2>/dev/null) && echo "on PATH: $t -> $p"; done; true'"'"'' ;;
+  labenv)
+    "${SSH[@]}" '/bin/bash -c '"'"'echo "date: $(date "+%Y-%m-%d %H:%M:%S %Z")"; sw_vers | tr "\n" " "; echo
+      echo "hardware: $(sysctl -n hw.model) $(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB, $(sysctl -n hw.ncpu) cores"
+      echo "uptime and load: $(uptime | sed "s/^ *//")"
+      echo "power: $(pmset -g | grep -E "powermode|lowpowermode|highpowermode" | tr -s " " | tr "\n" ";")"
+      echo "thermal: $(pmset -g therm 2>/dev/null | grep -v "^$" | tr -s " " | tr "\n" ";")"
+      echo "memory pressure: $(memory_pressure -Q 2>/dev/null | tail -1)"
+      echo "swap: $(sysctl -n vm.swapusage)"
+      echo "logged-in users: $(who | awk "{print \$1}" | sort -u | tr "\n" " ")"
+      echo "busiest processes (all users, %cpu %mem rss_kb user command):"
+      ps -Ao pcpu=,pmem=,rss=,user=,comm= -r | head -8
+      echo "largest memory users:"; ps -Ao rss=,pcpu=,user=,comm= -m | head -5'"'"'' ;;
+  fetch)
+    [ $# -eq 3 ] || die "usage: gbmac fetch <dir> <subdir>"
+    checkdir "$2"
+    [[ "$3" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] && [[ "$3" != *..* ]] || die "subdir must be a plain relative path"
+    [ -n "${GUIDE_RUN_DIR:-}" ] && [ -d "$GUIDE_RUN_DIR" ] || die "GUIDE_RUN_DIR is not set"
+    dest="$GUIDE_RUN_DIR/raw/$3"
+    [ -e "$dest" ] && die "raw/$3 already exists; fetch each time into a new subdirectory"
+    mkdir -p "$dest"
+    size=$("${SSH[@]}" "du -sk $(printf %q "$2/$3") | cut -f1") || die "no such directory: $2/$3"
+    [ "${size:-0}" -le 51200 ] || die "$3 is ${size} KB; over the 50 MB limit"
+    "${SSH[@]}" "cd $(printf %q "$2/$3") && find . -type f \( -name '*.log' -o -name '*.txt' -o -name '*.csv' -o -name '*.json' -o -name '*.md' \) -print0 | xargs -0 tar -cf - --" \
+      | tar -xf - -C "$dest" --no-same-owner --no-same-permissions && echo "fetched to $dest: $(find "$dest" -type f | wc -l) files" ;;
+  procs|reap|sweep)
+    # The test account's own processes: not this SSH session, not macOS services (/usr/libexec, /System, ...) and not
+    # apps in /Applications. Servers and background batches a killed run left behind show up here.
+    list=': GBPROCLIST; anc=" $$ "; p=$$; while [ "${p:-1}" -gt 1 ]; do p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); anc="$anc$p "; done
+      ps -U "$(id -u)" -o pid=,command= | while read -r pid cmd; do
+        case "$anc" in *" $pid "*) continue ;; esac
+        case "$cmd" in *GBPROCLIST*|"ps -U"*|sshd*|-bash|-zsh|-sh|/usr/libexec/*|/usr/sbin/*|/System/*|/Library/Apple/*|/sbin/*|/Applications/*|"/Library/Application Support/"*) continue ;; esac
+        echo "$pid $cmd"
+      done'
+    if [ "$1" = procs ]; then "${SSH[@]}" "/bin/bash -c $(printf %q "$list")"; exit $?; fi
+    # (macOS bash 3.2 cannot parse case patterns inside \$( ), so the list goes to a file first.)
+    # Only ever as the test account: refuse if the session is anyone else.
+    "${SSH[@]}" "/bin/bash -c $(printf %q "[ \"\$(id -un)\" = $(printf %q "$MAC_TEST_USER") ] || { echo 'gbmac: not the test account; nothing stopped' >&2; exit 1; }; f=\$(mktemp); { $list
+      } > \"\$f\"; pids=\$(cut -d' ' -f1 \"\$f\" | tr '\n' ' '); rm -f \"\$f\"
+      if [ -n \"\${pids// /}\" ]; then echo \"stopping: \$pids\"; kill -TERM \$pids 2>/dev/null; sleep 3; kill -KILL \$pids 2>/dev/null; fi; true")"
+    [ "$1" = reap ] && exit 0
+    # bash, not the Mac's default zsh, which aborts on a glob with no matches.
+    "${SSH[@]}" "/bin/bash -c 'for d in \"\$HOME\"/gb-guide-*; do [ -d \"\$d\" ] && rm -rf \"\$d\" && echo \"removed \$d\"; done; true'" ;;
+  *)
+    sed -n '2,10p' "$0"; exit 2 ;;
+esac
