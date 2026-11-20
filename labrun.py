@@ -529,8 +529,9 @@ class Runner:
             if err or not h1:
                 self.say(f'session 1 ledger unusable: {err or "no session header"}')
                 return 5
-            if h1[-1].get('inputs') != inputs:
-                diff = sorted(set(h1[-1]['inputs'].items()) ^ set(inputs.items()))[:4]
+            in1, in2 = lv.cross_session_inputs(h1[-1].get('inputs')), lv.cross_session_inputs(inputs)
+            if in1 != in2:
+                diff = sorted(set(in1.items()) ^ set(in2.items()))[:4]
                 self.say(f'the setup differs from session 1 (engine builds, models or prompts): {diff}')
                 return 3
             gap_h = (time.time() - dt.datetime.fromisoformat(h1[-1]['started']).timestamp()) / 3600

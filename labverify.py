@@ -419,6 +419,13 @@ def chain_hash(prev, body):
     return hashlib.sha256((prev + json.dumps(body, sort_keys=True, ensure_ascii=False)).encode()).hexdigest()
 
 
+def cross_session_inputs(inputs):
+    """Inputs as compared between session 1 and session 2. pip's *.dist-info/RECORD files are left out: they store
+    hashes of console scripts whose first line names the session folder, which is new each session, and every file
+    a RECORD lists is fingerprinted on its own anyway. Within one session (start against end) they still count."""
+    return {k: v for k, v in (inputs or {}).items() if not k.endswith('.dist-info/RECORD')}
+
+
 def read_ledger(path):
     """(records, problem or None). Each record carries prev and hash (SHA-256 over prev and its content)."""
     recs = []
@@ -728,8 +735,10 @@ def lab_verify(plan_path, rundir, derived_out, verdict_out, evid, slug=None, ses
                              f'the report must not call it a later day)')
             else:
                 problems.append(f'session 2 started {gap:.1f} h after session 1; the plan needs at least {need_gap:g} h')
-    if s2 and s1['header'].get('inputs') and s2['header'].get('inputs') != s1['header'].get('inputs'):
-        diff = sorted(set(s1['header']['inputs'].items()) ^ set((s2['header'].get('inputs') or {}).items()))[:6]
+    in1 = cross_session_inputs(s1['header'].get('inputs'))
+    in2 = cross_session_inputs(s2['header'].get('inputs')) if s2 else {}
+    if s2 and in1 and in2 != in1:
+        diff = sorted(set(in1.items()) ^ set(in2.items()))[:6]
         problems.append(f'session 2 measured different engine builds, models or prompts than session 1: {diff}')
     stats1 = group_stats(lab, s1)
     stats2 = group_stats(lab, s2) if s2 else {}
