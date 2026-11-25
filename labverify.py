@@ -550,8 +550,13 @@ def verify_session(plan, plan_path, rundir, evid, session):
     if not end:
         probs.append(f'session {session}: the runner did not finish (no end record); resume it or re-measure')
     else:
-        if end.get('inputs_after') != head.get('inputs'):
-            changed = sorted(set((head.get('inputs') or {}).items()) ^ set((end.get('inputs_after') or {}).items()))[:4]
+        # Exactly the fingerprints of the last start (the header, or a resume in a new Mac folder), and every file the
+        # same as when the session began (pip RECORD files aside, which name the folder: see cross_session_inputs).
+        last = next((r['inputs'] for r in reversed(recs[heads[-1] + 1:]) if r.get('type') == 'resume' and r.get('inputs')), head.get('inputs'))
+        after = end.get('inputs_after')
+        if after != last or cross_session_inputs(after) != cross_session_inputs(head.get('inputs')):
+            ref = last if after != last else head.get('inputs')
+            changed = sorted(set((ref or {}).items()) ^ set((after or {}).items()))[:4]
             probs.append(f'session {session}: engine builds, models or prompts changed during the session: {changed}')
         if end.get('expect_after'):
             probs.append(f'session {session}: at the end the installed files no longer matched lab.expect: {end["expect_after"][:3]}')
@@ -675,6 +680,23 @@ def compare(lab, stats, cells, p):
             'n_a': va[0], 'n_b': vb[0]}
 
 
+def _usable(c):
+    """A complete comparison with a finite positive ratio and a bounded interval (0 < low <= high)."""
+    ci = c.get('ci')
+    return (c.get('status') == 'complete' and isinstance(c.get('ratio'), (int, float)) and math.isfinite(c['ratio']) and c['ratio'] > 0
+            and bool(ci) and all(math.isfinite(x) for x in ci) and 0 < ci[0] <= ci[1])
+
+
+def repeated(c1, c2, tol):
+    """Replication rule (24 November 2026): both days usable, the same Separated verdict, the ratio within the tolerance
+    of the first day's, and, when the first day separated, the same direction. A comparison neither day separated
+    claims no direction, so the side of 1 its ratio lands on is not compared (it is noise, and 1.000 has no side);
+    it is reported only as "neither session separated a difference", never as equivalence."""
+    if not (_usable(c1) and _usable(c2)) or c1['separated'] != c2['separated'] or abs(c2['ratio'] / c1['ratio'] - 1) > tol:
+        return False
+    return c1['separated'] == 'no' or (c1['ratio'] > 1) == (c2['ratio'] > 1)
+
+
 def _cell_txt(k):
     return ' / '.join(x for x in k if x)
 
@@ -746,6 +768,7 @@ def lab_verify(plan_path, rundir, derived_out, verdict_out, evid, slug=None, ses
     tol = float((lab.get('replication') or {}).get('tolerance', 0.10))
     rows = []
     hold = []
+    null_rule = False
     for p in prim:
         c1 = compare(lab, stats1, s1['cells'], p)
         c2 = compare(lab, stats2, s2['cells'], p) if s2 else None
@@ -758,10 +781,14 @@ def lab_verify(plan_path, rundir, derived_out, verdict_out, evid, slug=None, ses
             if c1.get('status') != 'complete' or (c2 or {}).get('status') != 'complete':
                 rep = 'n/a'
             else:
-                same = (c1['separated'] == c2['separated'] and (c1['ratio'] > 1) == (c2['ratio'] > 1)
-                        and abs(c2['ratio'] / c1['ratio'] - 1) <= tol)
-                rep = 'yes' if same else 'NO'
+                rep = 'yes' if repeated(c1, c2, tol) else 'NO'
         where = f"{p['model']} / {p['length']} / {p['metric']}: {p['a']} vs {p['b']}"
+        if rep == 'yes' and c1.get('separated') == 'no' and (c1['ratio'] > 1) != (c2['ratio'] > 1):
+            null_rule = True  # the earlier rule would have held it: say which rule was used
+            notes.append(f'{where}: neither session separated a difference, and the earlier same-direction test would have '
+                         f'failed it (ratio {c1["ratio"]:.3f}, then {c2["ratio"]:.3f}); the replication rule of 24 November 2026 does '
+                         f'not compare the direction of a comparison neither session separated. A plan frozen before that date '
+                         f'stated the stricter rule; the report must say so.')
         if c1.get('status') == 'timeouts':
             pass  # pre-registered: a side that never finishes in time is the finding
         elif c1.get('status') != 'complete':
@@ -860,9 +887,15 @@ def lab_verify(plan_path, rundir, derived_out, verdict_out, evid, slug=None, ses
                          f'{_fmt(va[1])} | {_fmt(vb[1])} | {va[1] / vb[1]:.3f}x | {f"{ci[0]:.3f} to {ci[1]:.3f}" if ci else "n/a"} | {sep} |')
     if s2:
         L += ['', '## Second session (a later day)', '',
-              f'Each pre-registered primary comparison measured again in a fresh session. "Repeated" means the same Separated '
-              f'verdict, the same direction, and a ratio within {tol:.0%} of session 1\'s. Same team, same machine: this shows '
-              f'repeatability, not independent replication.', '',
+              (f'Each pre-registered primary comparison measured again in a fresh session. "Repeated" means the same Separated '
+               f'verdict, the same direction, and a ratio within {tol:.0%} of session 1\'s. Same team, same machine: this shows '
+               f'repeatability, not independent replication.' if not null_rule else
+               f'Each pre-registered primary comparison measured again in a fresh session. "Repeated" means both sessions have a '
+               f'bounded interval, the same Separated verdict, a ratio within {tol:.0%} of session 1\'s, and, for a comparison '
+               f'that separated, the same direction (rule of 24 November 2026). A comparison neither session separated claims no '
+               f'direction, so which side of 1 its ratio falls on is not compared; "repeated" then means only that neither '
+               f'session separated a difference, not that the two are equivalent. Same team, same machine: this shows '
+               f'repeatability, not independent replication.'), '',
               '| Model | Length | Metric | A vs B | Session 1 | Session 2 | Repeated |', '|---|---|---|---|---|---|---|']
 
         def ftxt(c):

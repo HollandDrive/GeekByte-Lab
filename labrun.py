@@ -548,10 +548,17 @@ class Runner:
         h = heads[-1] if heads else {}
         same_code = bool(heads) and (h['runner_files'] == cur if h.get('runner_files')
                                      else h.get('runner_sha256') == cur.get('labrun.py'))
-        if heads and heads[-1].get('inputs') == inputs and (same_code or counted):
-            self.ledger.add({'type': 'resume', 'at': now(), 'reaped': reaped, 'runner_files': runner_files()})
+        # Compared as between sessions: a resume after a broken-off session sets up in a new Mac folder, and pip's
+        # RECORD files name that folder (every file they list is fingerprinted on its own). The resume records the new
+        # fingerprints, and the verifier checks the end of the session against them and the start against the end.
+        # The latest start since the latest header (a resume before a new baseline is not this baseline's).
+        hi = max((i for i, r in enumerate(recs) if r.get('type') == 'session'), default=-1)
+        last = next((r['inputs'] for r in reversed(recs[hi + 1:]) if r.get('type') == 'resume' and r.get('inputs')), h.get('inputs'))
+        if heads and lv.cross_session_inputs(last) == lv.cross_session_inputs(inputs) and (same_code or counted):
+            self.ledger.add({'type': 'resume', 'at': now(), 'reaped': reaped, 'runner_files': runner_files(), 'inputs': inputs})
         elif heads and counted:
-            self.say('engine builds, models or prompts changed after measuring began; refusing to resume this session')
+            diff = sorted(set(lv.cross_session_inputs(last).items()) ^ set(lv.cross_session_inputs(inputs).items()))[:4]
+            self.say(f'engine builds, models or prompts changed after measuring began; refusing to resume this session: {diff}')
             return 5
         else:
             # A new session, or a new baseline after a setup fix (allowed only before any warm-up or measured run).
