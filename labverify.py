@@ -13,6 +13,8 @@ The lab plan's `lab` block is data that the lab runner (labrun.py) executes and 
     "cells": [{"model": "qwen36", "engine": ["mlx", "llama.cpp"], "config": "default", "length": ["4096", "131072"]}],
     "command": "./run.sh {model} {engine} {config} {length}",   run in workdir once per attempt; prints the metric lines
     "smoke": [{"model": "qwen36", "engine": "mlx", "config": "default", "length": "512"}],   quick runs before warm-ups
+    "smoke_max_minutes": 3,                      optional: the mean smoke-run time the time budget allows; the design
+                                                 smoke check sends a design whose smoke runs take longer back to the editor
     "warmups": 1, "runs": 5, "seed": 20261114, "timeout_s": 1800, "max_retries": 2, "max_hours": 6,
     "conditions": {"max_load1": 3.0, "max_cpu_pct": 15, "max_other_rss_gb": 8, "no_thermal_warning": true,
                    "cooldown_s": 20, "max_wait_s": 900},
@@ -363,6 +365,9 @@ def check_lab_plan(plan, article_text=None, mac_available=True):
             for c in expand(spec):
                 if not all(c[k] for k in ('model', 'engine', 'config', 'length')) or any(v and not SAFE.match(v) for v in c.values()):
                     probs.append(f'lab.smoke: bad cell {c}')
+    smax = lab.get('smoke_max_minutes')
+    if smax is not None and (isinstance(smax, bool) or not isinstance(smax, (int, float)) or not math.isfinite(smax) or smax <= 0):
+        probs.append('lab.smoke_max_minutes must be a positive number of minutes (the mean smoke-run time the time budget allows)')
     prim = primaries(lab)
     if not prim:
         probs.append('lab.primary lists no pre-registered comparison')

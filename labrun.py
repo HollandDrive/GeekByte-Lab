@@ -19,10 +19,12 @@ Every record goes into a hash-chained ledger outside the run directory, scrubbed
 Usage:
   labrun.py run <plan.json> <session 1|2> <rundir> <evidence dir> <mac dir>
   labrun.py smoke <plan.json> <rundir> <evidence dir> <mac dir>   checks and smoke runs only, in their own ledger
-      (lab-ledger-smoke.jsonl) and logs (raw/runner-smoke): the design check before a plan is frozen
+      (lab-ledger-smoke.jsonl) and logs (raw/runner-smoke): the design check before a plan is frozen. It runs every
+      smoke cell, not only up to the first failure, and names each failed cell and its log
 Exit: 0 done (end record written), 3 the setup is broken (smoke failed, inputs missing or not the files the plan names,
 or for session 2 not the same files as session 1; fix the setup and run again), 4 stopped at the deadline (end record
-written; unrun slots stay unrun), 5 the Mac or the session broke (resume by running again), 7 too early for session 2
+written; unrun slots stay unrun), 5 the Mac or the session broke (resume by running again), 6 (smoke only) the smoke
+runs passed but took longer on average than the plan's lab.smoke_max_minutes, 7 too early for session 2
 (the plan's min_gap_hours), 2 usage or plan.
 Resume: running the same session again continues from the ledger.
 
@@ -576,18 +578,56 @@ class Runner:
         self.deadline = t0 + float(self.lab['max_hours']) * 3600
         lab = self.lab
         # Smoke: before anything counts (again on a resume that has not reached the warm-ups yet).
+        took = []
         if not any(r.get('type') == 'attempt' and r['kind'] != 'smoke' for r in self.ledger.recs):
-            for spec in lab['smoke']:
-                for c in lv.expand(spec):
-                    c['measurement'] = c['measurement'] or 'main'
+            failed = []
+            for c in [c for spec in lab['smoke'] for c in lv.expand(spec)]:
+                c['measurement'] = c['measurement'] or 'main'
+                t1 = time.time()
+                try:
                     r = self.attempt(c, 'smoke')
-                    if r['outcome'] != 'ok':
-                        if self.smoke_only and r.get('skipped'):
-                            # The design check: a busy Mac says nothing about the design.
-                            self.say(f'smoke run not started: {r.get("conditions_note", "conditions not met")}')
-                            return 5
+                except (RunnerError, OSError, subprocess.SubprocessError) as e:
+                    # The Mac or the session broke after a smoke cell had already failed: that failure is a finding
+                    # about the design and stands (exit 3, not 5, which the design check reads as 'could not run').
+                    if not failed:
+                        raise
+                    self.say(f'smoke check stopped after {len(failed)} failed cell(s): {e}')
+                    break
+                # Time waited for a busy Mac to settle is the Mac's, not the design's.
+                took.append(('/'.join(x for x in lv.cell_key(c) if x),
+                             time.time() - t1 - float((r.get('conditions') or {}).get('waited_s') or 0)))
+                if r['outcome'] == 'ok':
+                    continue
+                if self.smoke_only and r.get('skipped'):
+                    if failed:
+                        break
+                    # The design check: a busy Mac says nothing about the design.
+                    self.say(f'smoke run not started: {r.get("conditions_note", "conditions not met")}')
+                    return 5
+                failed.append(r)
+                if not self.smoke_only:
+                    break
+                # The design check runs every smoke cell, so one review round shows every cell that fails (stopping
+                # at the first left the editor to find the next failure a round later, after another review).
+            if failed:
+                for r in failed:
+                    if self.smoke_only:  # the cell and its log, for the review round the design check writes
+                        cell = '/'.join(x for x in lv.cell_key(r['cell']) if x)
+                        self.say(f'smoke failed: {cell}: {r["reason"] or r["outcome"]}; log raw/runner-smoke/{r["log"]}')
+                    else:
                         self.say(f'smoke failed: {r["reason"]}')
-                        return 3
+                return 3
+        # The design check also times the smoke runs (with the cool-down and process checks, as in a session) against the
+        # plan's own bound, so a design whose time budget the Mac cannot meet comes back before it is frozen.
+        smax = lab.get('smoke_max_minutes')
+        mean_min = sum(s for _, s in took) / len(took) / 60 if took else 0.0
+        if self.smoke_only and smax and mean_min > float(smax):
+            each = ', '.join(f'{k} {s / 60:.2f}' for k, s in took)
+            # No end record (as for a failed smoke run): an end record would make the same command, run again on the
+            # unchanged plan, return 0 without timing anything.
+            self.say(f"smoke runs passed but took {mean_min:.2f} min on average, over the plan's smoke_max_minutes "
+                     f"{float(smax):g} (minutes per smoke run: {each})")
+            return 6
         if self.smoke_only:
             self.ledger.add({'type': 'end', 'finished': now(), 'reason': 'smoke only', 'unrun': {}})
             self.say('smoke runs passed (smoke only: nothing measured)')
