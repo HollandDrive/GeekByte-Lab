@@ -320,6 +320,10 @@ def check_lab_plan(plan, article_text=None, mac_available=True):
         if not isinstance(ch, dict) or ch.get('metric') not in metrics or ch.get('op') not in OPS or 'value' not in ch:
             probs.append(f'lab.checks: each check needs a known metric, op (== <= >= < >) and value: {ch}')
             continue
+        kinds = ch.get('kinds')
+        if 'kinds' in ch and (not isinstance(kinds, list) or not kinds or len(set(map(str, kinds))) != len(kinds)
+                              or any(k not in CHECK_KINDS for k in kinds)):
+            probs.append(f'lab.checks: "kinds" must be a non-empty list of distinct kinds from {list(CHECK_KINDS)}: {ch}')
         v = ch['value']
         if isinstance(v, str):
             ph = set(re.findall(r'\{([^{}]*)\}', v))
@@ -499,10 +503,26 @@ def extract(lab, engine, text):
     return vals, probs
 
 
-def run_checks(lab, cell, vals):
+CHECK_KINDS = ('design_smoke', 'smoke', 'warmup', 'measure')
+
+
+def attempt_kind(att):
+    """The kind a check's "kinds" names: a smoke run of the design smoke check (before the plan is frozen, recorded with
+    phase "design") is "design_smoke"; a frozen session's smoke runs are "smoke"."""
+    k = att.get('kind', '')
+    return 'design_smoke' if k == 'smoke' and att.get('phase') == 'design' else k
+
+
+def run_checks(lab, cell, vals, kind=None):
+    """Problems with a valid-looking attempt. A check with "kinds" applies only to attempts of those kinds (27 Nov,
+    guide-20261126T230849Z): a bound on a scored reply's diagnostics (stopped at the output limit, answer unreadable)
+    is a design diagnostic that catches a broken limit or parser before the plan is frozen; after that, a reply that
+    runs on into the budget is the model's outcome, scored by the frozen rule, never a reason to drop the run."""
     bad = []
     for ch in lab.get('checks') or []:
         if ch.get('engines') and cell['engine'] not in ch['engines']:
+            continue
+        if ch.get('kinds') and kind not in ch['kinds']:
             continue
         if ch['metric'] not in vals:
             continue
@@ -534,7 +554,7 @@ def classify(lab, cell, att, text):
         return 'invalid', 'conditions not met: ' + str(att.get('conditions_note', '')), vals
     if probs:
         return 'invalid', '; '.join(probs), vals
-    bad = run_checks(lab, cell, vals)
+    bad = run_checks(lab, cell, vals, attempt_kind(att))
     if bad:
         return 'invalid', '; '.join(bad), vals
     return 'ok', '', vals

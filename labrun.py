@@ -417,6 +417,8 @@ class Runner:
         k = lv.cell_key(cell)
         run_id = f's{self.session}-{seq:04d}'
         base = {'seq': seq, 'kind': kind, 'round': rnd, 'cell': dict(zip(lv.CELL_KEYS, k)), 'run_id': run_id}
+        if self.smoke_only:
+            base['phase'] = 'design'   # the design smoke check: checks with "kinds": ["design_smoke"] apply (lv.attempt_kind)
         cond = self.lab['conditions']
         if seq > 1 and cond.get('cooldown_s'):
             self.sleep(float(cond['cooldown_s']))
