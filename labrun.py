@@ -22,7 +22,8 @@ Usage:
       (lab-ledger-smoke.jsonl) and logs (raw/runner-smoke): the design check before a plan is frozen. It runs every
       smoke cell, not only up to the first failure, and names each failed cell and its log
 Exit: 0 done (end record written), 3 the setup is broken (smoke failed, inputs missing or not the files the plan names,
-or for session 2 not the same files as session 1; fix the setup and run again), 4 stopped at the deadline (end record
+for session 1 not the same lab.inputs as the passing design smoke check, whose ledger is kept beside the plan as
+design-smoke-ledger.jsonl, or for session 2 not the same files as session 1; fix the setup and run again), 4 stopped at the deadline (end record
 written; unrun slots stay unrun), 5 the Mac or the session broke (resume by running again), 6 (smoke only) the smoke
 runs passed but took longer on average than the plan's lab.smoke_max_minutes, 7 too early for session 2
 (the plan's min_gap_hours), 2 usage or plan.
@@ -367,7 +368,7 @@ class Runner:
                 h[m.group(2)] = m.group(1)
         if 'GBHASHEND' not in out:
             rc = rc or 1
-        return rc, h, missing
+        return rc, lv.ledger_inputs(h), missing   # as the ledger stores them: scrubbed, no fingerprint lost
 
     def _sha(self, rel, timeout=1800):
         q = shlex.quote(rel)
@@ -524,6 +525,22 @@ class Runner:
         if wrong:
             self.say('the installed files are not the ones the plan names: ' + '; '.join(wrong[:6]))
             return 3
+        if self.session == 1 and not self.smoke_only:
+            # Before anything is measured: the setup the design smoke check passed with, whose ledger the pipeline keeps
+            # beside the frozen plan (pinned). Files the setup resolves or builds itself (a dependency lock, a source
+            # checkout) have no published SHA-256 the plan could pre-register in lab.expect; this binds them instead.
+            sp = os.path.join(os.path.dirname(os.path.abspath(self.plan_path)), 'design-smoke-ledger.jsonl')
+            if os.path.exists(sp):
+                sm, err = lv.read_ledger(sp)
+                h0 = [r for r in sm if r.get('type') == 'session']
+                if err or not h0 or not any(r.get('type') == 'end' and r.get('reason') == 'smoke only' for r in sm):
+                    self.say(f'design smoke ledger unusable: {err or "not a passing design smoke check"}')
+                    return 5
+                in0, in1 = lv.cross_session_inputs(h0[-1].get('inputs')), lv.cross_session_inputs(inputs)
+                if in0 != in1:
+                    diff = sorted(set(in0.items()) ^ set(in1.items()))[:4]
+                    self.say(f'the setup differs from the one the design smoke check passed with (lab.inputs): {diff}')
+                    return 3
         if self.session == 2:
             # Before anything is measured: the same builds, models and prompts as session 1, and late enough.
             s1, err = lv.read_ledger(os.path.join(os.path.dirname(self.ledger.path), 'lab-ledger-s1.jsonl'))

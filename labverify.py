@@ -427,8 +427,36 @@ def chain_hash(prev, body):
 def cross_session_inputs(inputs):
     """Inputs as compared between session 1 and session 2. pip's *.dist-info/RECORD files are left out: they store
     hashes of console scripts whose first line names the session folder, which is new each session, and every file
-    a RECORD lists is fingerprinted on its own anyway. Within one session (start against end) they still count."""
-    return {k: v for k, v in (inputs or {}).items() if not k.endswith('.dist-info/RECORD')}
+    a RECORD lists is fingerprinted on its own anyway. Within one session (start against end) they still count.
+    Both sides are taken in the form a ledger stores them (ledger_inputs), so live fingerprints compare with a ledger's."""
+    return {k: v for k, v in ledger_inputs(inputs).items() if not k.endswith('.dist-info/RECORD')}
+
+
+def ledger_inputs(inputs):
+    """Input fingerprints in the form a ledger stores them: names scrubbed as every ledger record is. The address scrub
+    also rewrites a four-part version number in a file name (protoc-3-21-12-0 with dots), so two files can share a
+    scrubbed name; each keeps its own entry, so no fingerprint is lost and a changed or missing file still shows. The
+    second and later (in the order of the original names) are numbered inside the scrub's first placeholder
+    (opencv-<lab-ip#2>.dist-info/RECORD), so the file's own ending still counts (cross_session_inputs) and the name
+    cannot be a real file's; a number already taken is skipped. The runner records inputs in this form; applied again,
+    it changes nothing."""
+    groups = {}
+    for k in sorted(inputs or {}):
+        groups.setdefault(scrub(k), []).append(k)
+    out = {sk: inputs[ks[0]] for sk, ks in groups.items()}
+    for sk, ks in groups.items():
+        n = 1
+        for k in ks[1:]:
+            while True:
+                n += 1
+                key = _PLACEHOLDER.sub(lambda m: f'<{m.group(1)}#{n}>', sk, count=1)
+                if key not in out and key not in groups:
+                    break
+            out[key] = inputs[k]
+    return out
+
+
+_PLACEHOLDER = re.compile(r'<(lab-ip|lab|server|email|redacted)>')
 
 
 def read_ledger(path):
